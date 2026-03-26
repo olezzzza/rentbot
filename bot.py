@@ -48,45 +48,88 @@ def save_seen(seen: set):
 
 def fetch_listings() -> list:
     """Получает объявления через внутренний API daft.ie."""
-    body = json.dumps({
-        "section":        "residential-for-rent",
-        "filters": [
-            {"name": "adState",          "values": ["published"]},
-            {"name": "rentalPrice_to",   "values": ["1200"]},
-            {"name": "numBedrooms_from", "values": ["3"]},
-        ],
-        "andFilters": [],
-        "ranges": [],
-        "geoFilter": {
-            "storedShapeIds": ["1085"],   # Gorey, Co. Wexford
-            "geoSearchType":  "STORED_SHAPE"
-        },
-        "sort":     "publishDateDesc",
-        "from":     0,
-        "pageSize": 20,
-    }).encode("utf-8")
+
+    # Пробуем разные варианты geoFilter для Gorey
+    geo_options = [
+        {"storedShapeIds": ["1085"],   "geoSearchType": "STORED_SHAPE"},
+        {"storedShapeIds": ["102085"], "geoSearchType": "STORED_SHAPE"},
+        {"storedShapeIds": ["3791"],   "geoSearchType": "STORED_SHAPE"},
+    ]
 
     headers = {
-        "Content-Type":  "application/json",
-        "brand":         "daft",
-        "platform":      "web",
-        "User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Origin":        "https://www.daft.ie",
-        "Referer":       "https://www.daft.ie/",
+        "Content-Type": "application/json",
+        "brand":        "daft",
+        "platform":     "web",
+        "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Origin":       "https://www.daft.ie",
+        "Referer":      "https://www.daft.ie/",
     }
 
-    req = urllib.request.Request(API_URL, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    for geo in geo_options:
+        try:
+            body = json.dumps({
+                "section":    "residential-for-rent",
+                "filters": [
+                    {"name": "adState",          "values": ["published"]},
+                    {"name": "rentalPrice_to",   "values": ["1200"]},
+                    {"name": "numBedrooms_from", "values": ["3"]},
+                ],
+                "andFilters": [],
+                "ranges":     [],
+                "geoFilter":  geo,
+                "sort":       "publishDateDesc",
+                "from":       0,
+                "pageSize":   20,
+            }).encode("utf-8")
 
-    listings = []
-    for item in data.get("listings", []):
-        listing = item.get("listing", item)
-        parsed  = _parse_listing(listing)
-        if parsed:
-            listings.append(parsed)
+            req = urllib.request.Request(API_URL, data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
 
-    return listings
+            listings = []
+            for item in data.get("listings", []):
+                listing = item.get("listing", item)
+                parsed  = _parse_listing(listing)
+                if parsed:
+                    listings.append(parsed)
+
+            if listings:
+                return listings
+
+        except Exception as e:
+            print(f"API попытка с geo {geo} не удалась: {e}")
+            continue
+
+    # Резервный вариант — поиск через DuckDuckGo
+    return _search_fallback()
+
+
+def _search_fallback() -> list:
+    """Резервный поиск через DuckDuckGo если API не работает."""
+    try:
+        from duckduckgo_search import DDGS
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(
+                "site:daft.ie gorey wexford rent 3 bedroom",
+                max_results=10
+            ):
+                url = r.get("href", "")
+                if "daft.ie" in url and "/for-rent/" in url:
+                    listing_id = url.strip("/").split("/")[-1]
+                    results.append({
+                        "id":      listing_id,
+                        "title":   r.get("title", ""),
+                        "address": "Gorey, Co. Wexford",
+                        "price":   "",
+                        "beds":    "3+",
+                        "baths":   "",
+                        "url":     url,
+                    })
+        return results
+    except Exception as e:
+        print(f"Fallback поиск не удался: {e}")
+        return []
 
 
 def _parse_listing(item: dict) -> dict | None:
@@ -184,17 +227,20 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("🔍 Проверяю daft.ie...")
     try:
+        all_listings = fetch_listings()
+        await update.message.reply_text(f"📊 Найдено объявлений всего: {len(all_listings)}")
+
         new_listings = check_new_listings()
         if new_listings:
             await update.message.reply_text(
-                f"🎉 Найдено новых объявлений: {len(new_listings)}"
+                f"🎉 Новых объявлений: {len(new_listings)}"
             )
             for l in new_listings:
                 await update.message.reply_text(format_listing(l), parse_mode="Markdown")
         else:
             await update.message.reply_text(
-                "😕 Новых объявлений нет.\n"
-                f"Слежу за: Gorey, 3+ спальни, до €1200"
+                "😕 Новых объявлений нет (все уже видел).\n"
+                "Напиши /reset чтобы сбросить историю."
             )
     except Exception as e:
         await update.message.reply_text(f"Ошибка при проверке: {e}")
