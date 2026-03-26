@@ -3,6 +3,7 @@ import json
 import asyncio
 import re
 import urllib.request
+import urllib.parse
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -21,6 +22,7 @@ SEARCH_URL = (
     "https://www.daft.ie/property-for-rent/gorey-co-wexford"
     "?numBeds_from=3&rentalPrice_to=1200&sort=publishDateDesc"
 )
+API_URL = "https://gateway.daft.ie/old/v1/listings/residential-for-rent/"
 CHECK_INTERVAL_MINUTES = 30
 
 
@@ -45,68 +47,50 @@ def save_seen(seen: set):
 # ═══════════════════════════════════════════════════════════════════
 
 def fetch_listings() -> list:
-    """Получает объявления с daft.ie и возвращает список словарей."""
+    """Получает объявления через внутренний API daft.ie."""
+    body = json.dumps({
+        "section":        "residential-for-rent",
+        "filters": [
+            {"name": "adState",          "values": ["published"]},
+            {"name": "rentalPrice_to",   "values": ["1200"]},
+            {"name": "numBedrooms_from", "values": ["3"]},
+        ],
+        "andFilters": [],
+        "ranges": [],
+        "geoFilter": {
+            "storedShapeIds": ["1085"],   # Gorey, Co. Wexford
+            "geoSearchType":  "STORED_SHAPE"
+        },
+        "sort":     "publishDateDesc",
+        "from":     0,
+        "pageSize": 20,
+    }).encode("utf-8")
+
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-IE,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Content-Type":  "application/json",
+        "brand":         "daft",
+        "platform":      "web",
+        "User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Origin":        "https://www.daft.ie",
+        "Referer":       "https://www.daft.ie/",
     }
 
-    req = urllib.request.Request(SEARCH_URL, headers=headers)
+    req = urllib.request.Request(API_URL, data=body, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=15) as resp:
-        html = resp.read().decode("utf-8", errors="ignore")
+        data = json.loads(resp.read().decode("utf-8"))
 
     listings = []
-
-    # daft.ie — Next.js приложение, данные в __NEXT_DATA__
-    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
-    if match:
-        try:
-            data     = json.loads(match.group(1))
-            # Путь к листингам может меняться — обходим дерево
-            props    = data.get("props", {}).get("pageProps", {})
-            listings = _extract_from_props(props)
-        except Exception as e:
-            print(f"JSON parse error: {e}")
-
-    # Резервный метод — парсим HTML напрямую
-    if not listings:
-        listings = _parse_html_fallback(html)
+    for item in data.get("listings", []):
+        listing = item.get("listing", item)
+        parsed  = _parse_listing(listing)
+        if parsed:
+            listings.append(parsed)
 
     return listings
 
 
-def _extract_from_props(props: dict) -> list:
-    """Извлекает листинги из pageProps Next.js."""
-    results = []
-
-    # Пробуем разные пути к данным
-    candidates = [
-        props.get("listings", []),
-        props.get("props", {}).get("listings", []),
-        props.get("searchResults", {}).get("listings", []),
-        props.get("data", {}).get("listings", []),
-    ]
-
-    for candidate in candidates:
-        if isinstance(candidate, list) and candidate:
-            for item in candidate:
-                listing = item.get("listing", item)
-                parsed  = _parse_listing(listing)
-                if parsed:
-                    results.append(parsed)
-            if results:
-                break
-
-    return results
-
-
 def _parse_listing(item: dict) -> dict | None:
-    """Парсит один листинг из JSON."""
+    """Парсит один листинг из JSON API daft.ie."""
     try:
         listing_id = str(item.get("id", ""))
         if not listing_id:
@@ -116,11 +100,11 @@ def _parse_listing(item: dict) -> dict | None:
         if isinstance(price, dict):
             price = price.get("value", "") or price.get("display", "")
 
-        title   = item.get("title", "") or item.get("header", "")
-        address = item.get("address", "") or item.get("displayAddress", "")
-        beds    = item.get("numBedrooms", "") or item.get("bedrooms", "")
-        baths   = item.get("numBathrooms", "") or item.get("bathrooms", "")
-        url     = item.get("daftShortcode", "") or item.get("url", "")
+        title   = item.get("title",          "") or item.get("header",          "")
+        address = item.get("address",         "") or item.get("displayAddress",  "")
+        beds    = item.get("numBedrooms",     "") or item.get("bedrooms",        "")
+        baths   = item.get("numBathrooms",    "") or item.get("bathrooms",       "")
+        url     = item.get("daftShortcode",   "") or item.get("url",             "")
         if url and not url.startswith("http"):
             url = f"https://www.daft.ie{url}"
 
@@ -135,31 +119,6 @@ def _parse_listing(item: dict) -> dict | None:
         }
     except Exception:
         return None
-
-
-def _parse_html_fallback(html: str) -> list:
-    """Резервный парсинг HTML если JSON не найден."""
-    results = []
-
-    # Ищем блоки объявлений по data-testid или href паттернам daft.ie
-    ids   = re.findall(r'href="(/for-rent/[^"]+)"', html)
-    seen_urls = set()
-    for path in ids:
-        if path in seen_urls:
-            continue
-        seen_urls.add(path)
-        listing_id = path.strip("/").replace("/", "_")
-        results.append({
-            "id":      listing_id,
-            "title":   path.split("/")[-1].replace("-", " ").title(),
-            "address": "",
-            "price":   "",
-            "beds":    "",
-            "baths":   "",
-            "url":     f"https://www.daft.ie{path}",
-        })
-
-    return results[:20]
 
 
 # ═══════════════════════════════════════════════════════════════════
